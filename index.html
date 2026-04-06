@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Particle Body</title>
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+
+    #view {
+      width: 100vw;
+      height: 100vh;
+      display: block;
+      background: #000;
+    }
+
+    #video {
+      position: fixed;
+      opacity: 0;
+      pointer-events: none;
+      width: 1px;
+      height: 1px;
+    }
+
+    .hud {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      background: rgba(10, 14, 20, 0.55);
+      border: 1px solid rgba(120, 150, 190, 0.25);
+      border-radius: 10px;
+      padding: 10px 12px;
+      color: #c7d4ea;
+      font-size: 12px;
+      line-height: 1.45;
+      backdrop-filter: blur(4px);
+      user-select: none;
+    }
+
+    .hud b {
+      color: #f2f6ff;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="view"></canvas>
+  <video id="video" autoplay playsinline muted></video>
+  <div class="hud">
+    <div><b>Particle Body</b></div>
+    <div>Move to restore. Stay still to dissolve from edges.</div>
+    <div id="status">Initializing…</div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js"></script>
+  <script>
+    // ==============================================================
+    // Adjustable Parameters
+    // ==============================================================
+    const SETTINGS = {
+      // particle density: lower = denser body silhouette
+      particleDensityStep: 4,
+      // motion threshold: baseline sensitivity for movement detection
+      motionThreshold: 0.03,
+      // dissolve speed: higher = faster edge-first decay when still
+      dissolveSpeed: 0.22,
+      // restore strength: higher = stronger pull back to target when moving
+      restoreStrength: 0.25,
+
+      segmentationWidth: 192,
+      segmentationHeight: 144,
+      edgeProbeRadius: 20,
+      stillnessDelaySec: 1.8,
+      heavyDispersionDelaySec: 5.0,
+      maxParticles: 9000,
+      driftJitter: 0.23,
+      drag: 0.89,
+      particleSize: 1.85,
+      glowBlur: 10,
+      bodyColor: 'rgba(238, 243, 255, 0.85)',
+      glowColor: 'rgba(130, 175, 255, 0.17)'
+    };
+
+    const canvas = document.getElementById('view');
+    const ctx = canvas.getContext('2d');
+    const video = document.getElementById('video');
+    const statusEl = document.getElementById('status');
+
+    const segCanvas = document.createElement('canvas');
+    segCanvas.width = SETTINGS.segmentationWidth;
+    segCanvas.height = SETTINGS.segmentationHeight;
+    const segCtx = segCanvas.getContext('2d', { willReadFrequently: true });
+
+    const rgbCanvas = document.createElement('canvas');
+    rgbCanvas.width = SETTINGS.segmentationWidth;
+    rgbCanvas.height = SETTINGS.segmentationHeight;
+    const rgbCtx = rgbCanvas.getContext('2d', { willReadFrequently: true });
+
+    const particles = [];
+    const targets = [];
+
+    let prevMaskedLuma = null;
+    let motionEMA = 0;
+    let dissolveAmount = 0;
+    let lastMoveTime = performance.now();
+    let frameReady = false;
+
+    const tempVec = { x: 0, y: 0 };
+
+    function resize() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+
+    window.addEventListener('resize', resize);
+    resize();
+
+    function clamp(v, min, max) {
+      return Math.max(min, Math.min(max, v));
+    }
+
+    function smoothstep(edge0, edge1, x) {
+      const t = clamp((x - edge0) / (edge1 - edge0), 0, 1);
+      return t * t * (3 - 2 * t);
+    }
+
+    function computeEdgeDepth(maskData, x, y, w, h, maxRadius) {
+      const dirs = [
+        [1, 0],
+        [-1, 0],
+        [0, 1],
+        [0, -1],
+        [1, 1],
+        [1, -1],
+        [-1, 1],
+        [-1, -1]
+      ];
+      let minHit = maxRadius;
+
+      for (let d = 0; d < dirs.length; d++) {
+        const dx = dirs[d][0];
+        const dy = dirs[d][1];
+
+        for (let r = 1; r <= maxRadius; r++) {
+          const px = x + dx * r;
+          const py = y + dy * r;
+          if (px < 0 || py < 0 || px >= w || py >= h) {
+            minHit = Math.min(minHit, r);
+            break;
+          }
+          const idx = (py * w + px) * 4;
+          if (maskData[idx] < 16) {
+            minHit = Math.min(minHit, r);
+            break;
+          }
+        }
+      }
+
+      return clamp(minHit / maxRadius, 0, 1);
+    }
+
+    function updateTargets(maskImageData) {
+      targets.length = 0;
+      const { data, width: w, height: h } = maskImageData;
+      const step = SETTINGS.particleDensityStep;
+
+      let sumX = 0;
+      let sumY = 0;
+      let count = 0;
+
+      for (let y = 0; y < h; y += step) {
+        for (let x = 0; x < w; x += step) {
+          const idx = (y * w + x) * 4;
+          const alpha = data[idx];
+          if (alpha < 20) continue;
+
+          const edgeDepth = computeEdgeDepth(data, x, y, w, h, SETTINGS.edgeProbeRadius);
+          const tx = (1 - x / w) * canvas.width;
+          const ty = (y / h) * canvas.height;
+
+          targets.push({ x: tx, y: ty, edgeDepth });
+          sumX += tx;
+          sumY += ty;
+          count++;
+          if (targets.length >= SETTINGS.maxParticles) break;
+        }
+        if (targets.length >= SETTINGS.maxParticles) break;
+      }
+
+      if (!count) {
+        tempVec.x = canvas.width * 0.5;
+        tempVec.y = canvas.height * 0.5;
+      } else {
+        tempVec.x = sumX / count;
+        tempVec.y = sumY / count;
+      }
+    }
+
+    function syncParticleCount() {
+      const desired = targets.length;
+      while (particles.length < desired) {
+        const t = targets[particles.length % Math.max(desired, 1)] || { x: canvas.width * 0.5, y: canvas.height * 0.5, edgeDepth: 0 };
+        particles.push({
+          x: t.x + (Math.random() - 0.5) * 4,
+          y: t.y + (Math.random() - 0.5) * 4,
+          vx: 0,
+          vy: 0,
+          tx: t.x,
+          ty: t.y,
+          edgeDepth: t.edgeDepth,
+          seed: Math.random() * 1000,
+        });
+      }
+      if (particles.length > desired) {
+        particles.length = desired;
+      }
+    }
+
+    function updateMotion(maskedLuma) {
+      if (!prevMaskedLuma || prevMaskedLuma.length !== maskedLuma.length) {
+        prevMaskedLuma = new Uint8ClampedArray(maskedLuma);
+        return 0;
+      }
+
+      let diff = 0;
+      let active = 0;
+      for (let i = 0; i < maskedLuma.length; i++) {
+        const curr = maskedLuma[i];
+        const prev = prevMaskedLuma[i];
+        if (curr === 0 && prev === 0) continue;
+        diff += Math.abs(curr - prev);
+        active++;
+      }
+
+      prevMaskedLuma.set(maskedLuma);
+      if (!active) return 0;
+
+      const normalized = diff / (active * 255);
+      motionEMA = motionEMA * 0.84 + normalized * 0.16;
+      return motionEMA;
+    }
+
+    function updateParticles(dt, motionStrength) {
+      const moving = motionStrength > SETTINGS.motionThreshold;
+
+      if (moving) {
+        lastMoveTime = performance.now();
+      }
+
+      const stillMs = performance.now() - lastMoveTime;
+      const stillSec = stillMs / 1000;
+
+      if (stillSec > SETTINGS.stillnessDelaySec) {
+        dissolveAmount += SETTINGS.dissolveSpeed * dt;
+      } else {
+        dissolveAmount -= SETTINGS.restoreStrength * dt * 1.4;
+      }
+
+      if (stillSec > SETTINGS.heavyDispersionDelaySec) {
+        dissolveAmount += SETTINGS.dissolveSpeed * dt * 0.8;
+      }
+
+      dissolveAmount = clamp(dissolveAmount, 0, 1);
+
+      const restore = smoothstep(SETTINGS.motionThreshold, SETTINGS.motionThreshold * 5.5, motionStrength);
+      const attraction = (0.05 + restore * SETTINGS.restoreStrength) * (1 - dissolveAmount * 0.7);
+
+      const edgeWeightPower = 1.6;
+      for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        const t = targets[i];
+        if (!t) continue;
+
+        p.tx = t.x;
+        p.ty = t.y;
+        p.edgeDepth = t.edgeDepth;
+
+        const dx = p.tx - p.x;
+        const dy = p.ty - p.y;
+
+        const edgePriority = Math.pow(1 - p.edgeDepth, edgeWeightPower);
+        const edgeDissolve = dissolveAmount * edgePriority;
+
+        const outwardX = p.x - tempVec.x;
+        const outwardY = p.y - tempVec.y;
+        const outLen = Math.hypot(outwardX, outwardY) + 1e-4;
+        const ox = outwardX / outLen;
+        const oy = outwardY / outLen;
+
+        const jitter = (Math.sin(p.seed + performance.now() * 0.0017) + Math.cos(p.seed * 1.7 + performance.now() * 0.0012)) * 0.5;
+
+        p.vx += dx * attraction;
+        p.vy += dy * attraction;
+
+        p.vx += ox * edgeDissolve * (0.45 + Math.random() * 0.12);
+        p.vy += oy * edgeDissolve * (0.45 + Math.random() * 0.12);
+
+        p.vx += jitter * SETTINGS.driftJitter * edgeDissolve;
+        p.vy += (Math.sin(jitter + p.seed) * SETTINGS.driftJitter) * edgeDissolve;
+
+        p.vx *= SETTINGS.drag;
+        p.vy *= SETTINGS.drag;
+
+        p.x += p.vx;
+        p.y += p.vy;
+      }
+
+      statusEl.textContent = `motion: ${motionStrength.toFixed(3)} | dissolve: ${dissolveAmount.toFixed(2)} | particles: ${particles.length}`;
+    }
+
+    function render() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.shadowBlur = SETTINGS.glowBlur;
+      ctx.shadowColor = SETTINGS.glowColor;
+      ctx.fillStyle = SETTINGS.bodyColor;
+
+      const s = SETTINGS.particleSize;
+      for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        ctx.fillRect(p.x, p.y, s, s);
+      }
+      ctx.restore();
+    }
+
+    function getMaskedLuma(maskImageData) {
+      const mask = maskImageData.data;
+      rgbCtx.save();
+      rgbCtx.scale(-1, 1);
+      rgbCtx.drawImage(video, -rgbCanvas.width, 0, rgbCanvas.width, rgbCanvas.height);
+      rgbCtx.restore();
+
+      const rgb = rgbCtx.getImageData(0, 0, rgbCanvas.width, rgbCanvas.height).data;
+      const luma = new Uint8ClampedArray(rgbCanvas.width * rgbCanvas.height);
+
+      for (let i = 0, p = 0; i < rgb.length; i += 4, p++) {
+        if (mask[i] < 20) {
+          luma[p] = 0;
+          continue;
+        }
+        luma[p] = (rgb[i] * 0.299 + rgb[i + 1] * 0.587 + rgb[i + 2] * 0.114) | 0;
+      }
+
+      return luma;
+    }
+
+    function onResults(results) {
+      if (!results.segmentationMask) return;
+
+      segCtx.clearRect(0, 0, segCanvas.width, segCanvas.height);
+      segCtx.drawImage(results.segmentationMask, 0, 0, segCanvas.width, segCanvas.height);
+
+      const maskImageData = segCtx.getImageData(0, 0, segCanvas.width, segCanvas.height);
+      updateTargets(maskImageData);
+      syncParticleCount();
+
+      const maskedLuma = getMaskedLuma(maskImageData);
+      const motionStrength = updateMotion(maskedLuma);
+      updateParticles(1 / 60, motionStrength);
+      render();
+
+      frameReady = true;
+    }
+
+    async function start() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            facingMode: 'user'
+          },
+          audio: false
+        });
+        video.srcObject = stream;
+
+        const segmenter = new SelfieSegmentation({
+          locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`
+        });
+
+        segmenter.setOptions({
+          modelSelection: 1,
+          selfieMode: true
+        });
+        segmenter.onResults(onResults);
+
+        const camera = new Camera(video, {
+          onFrame: async () => {
+            await segmenter.send({ image: video });
+          },
+          width: 640,
+          height: 480
+        });
+
+        await camera.start();
+        statusEl.textContent = 'Camera started.';
+
+        const loop = () => {
+          if (!frameReady) render();
+          requestAnimationFrame(loop);
+        };
+        loop();
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = 'Camera permission required.';
+      }
+    }
+
+    start();
+  </script>
+</body>
+</html>
